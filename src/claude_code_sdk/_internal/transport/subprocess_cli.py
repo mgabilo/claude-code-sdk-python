@@ -182,23 +182,111 @@ class SubprocessCLITransport(Transport):
         async with anyio.create_task_group() as tg:
             tg.start_soon(read_stderr)
 
+            json_buffer = ""
+            chunk_count = 0
+            
+            # Debug: Print when we start buffering
+            debug_enabled = os.environ.get("CLAUDE_SDK_DEBUG") == "1"
+            
             try:
                 async for line in self._stdout_stream:
                     line_str = line.strip()
                     if not line_str:
                         continue
 
+                    chunk_count += 1
+                    
+                    # Debug: Show what we received
+                    if debug_enabled:
+                        print(f"\n[SDK DEBUG] Chunk #{chunk_count}: Received {len(line_str)} chars")
+                        if len(line_str) > 100:
+                            print(f"[SDK DEBUG] First 50 chars: {line_str[:50]}")
+                            print(f"[SDK DEBUG] Last 50 chars: {line_str[-50:]}")
+                        else:
+                            print(f"[SDK DEBUG] Full chunk: {line_str}")
+
+                    # Add to buffer
+                    json_buffer += line_str
+                    
+                    if debug_enabled:
+                        print(f"[SDK DEBUG] Buffer now has {len(json_buffer)} chars total")
+                    
+                    # Try to parse the buffer as JSON
                     try:
-                        data = json.loads(line_str)
+                        data = json.loads(json_buffer)
+                        # Success! Clear buffer and yield
+                        if debug_enabled:
+                            print(f"[SDK DEBUG] Successfully parsed JSON after {chunk_count} chunks")
+                            print(f"[SDK DEBUG] Message type: {data.get('type', 'unknown')}")
+                            if data.get('type') == 'assistant' and 'message' in data:
+                                content_length = len(str(data['message'].get('content', [])))
+                                print(f"[SDK DEBUG] Assistant message content length: {content_length}")
+                        
+                        json_buffer = ""
+                        chunk_count = 0
+                        
                         try:
                             yield data
                         except GeneratorExit:
                             # Handle generator cleanup gracefully
                             return
                     except json.JSONDecodeError as e:
-                        if line_str.startswith("{") or line_str.startswith("["):
-                            raise SDKJSONDecodeError(line_str, e) from e
-                        continue
+                        # If buffer starts with JSON but is incomplete, continue buffering
+                        if json_buffer.startswith("{") or json_buffer.startswith("["):
+                            # Check if this looks like a complete JSON parse error (not truncation)
+                            # Common truncation errors have specific patterns
+                            error_str = str(e)
+                            if "Unterminated string" in error_str or "Expecting" in error_str or "Unexpected end" in error_str:
+                                # Likely incomplete JSON, keep buffering
+                                if debug_enabled:
+                                    print(f"[SDK DEBUG] JSON incomplete, continuing to buffer. Error: {error_str}")
+                                    print(f"[SDK DEBUG] Buffer ends with: ...{json_buffer[-50:]}")
+                                continue
+                            elif "Extra data" in error_str:
+                                # Multiple JSON objects on same line
+                                if debug_enabled:
+                                    print(f"[SDK DEBUG] Multiple JSON objects detected, splitting...")
+                                
+                                # Try to find where the first JSON ends
+                                try:
+                                    # Use JSONDecoder to find the end of first JSON object
+                                    decoder = json.JSONDecoder()
+                                    first_obj, idx = decoder.raw_decode(json_buffer)
+                                    
+                                    # Yield the first object
+                                    if debug_enabled:
+                                        print(f"[SDK DEBUG] First JSON object parsed, {idx} chars")
+                                        print(f"[SDK DEBUG] Remaining buffer: {len(json_buffer) - idx} chars")
+                                    
+                                    yield first_obj
+                                    
+                                    # Keep the rest in buffer
+                                    json_buffer = json_buffer[idx:].strip()
+                                    chunk_count = 0
+                                    
+                                    if json_buffer:
+                                        if debug_enabled:
+                                            print(f"[SDK DEBUG] Processing remaining JSON in buffer...")
+                                        # Try to parse remaining buffer immediately
+                                        continue
+                                except Exception as decode_error:
+                                    if debug_enabled:
+                                        print(f"[SDK DEBUG] Failed to split JSON: {decode_error}")
+                                    raise SDKJSONDecodeError(json_buffer, e) from e
+                            else:
+                                # Other JSON error, not truncation
+                                if debug_enabled:
+                                    print(f"[SDK DEBUG] Real JSON error detected: {error_str}")
+                                    print(f"[SDK DEBUG] Full buffer ({len(json_buffer)} chars):")
+                                    print(json_buffer)
+                                raise SDKJSONDecodeError(json_buffer, e) from e
+                        else:
+                            # Not JSON, clear buffer and continue
+                            if debug_enabled:
+                                print(f"[SDK DEBUG] Non-JSON content detected, clearing buffer")
+                            json_buffer = ""
+                            chunk_count = 0
+                            continue
 
             except anyio.ClosedResourceError:
                 pass
